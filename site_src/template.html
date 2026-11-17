@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Choosing alarm thresholds for machine failure prediction</title>
+<meta name="description" content="ES 335 project: how the alarm threshold of a failure-prediction model trades missed failures against false alarms, and how the best threshold moves with cost.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<a class="skip" href="#question">Skip to the write-up</a>
+<nav class="top" aria-label="Sections">
+  <a href="#try">Try it</a><a href="#question">Question</a><a href="#data">Data</a><a href="#preprocessing">Preprocessing</a>
+  <a href="#methods">Methods</a><a href="#evaluation">Evaluation</a><a href="#results">Results</a><a href="#errors">Errors</a>
+  <a href="#limitations">Limitations</a><a href="#conclusion">Conclusion</a><a href="#reproduce">Reproduce</a>
+</nav>
+
+<main>
+<div class="stage">
+<header class="hero wrap">
+  <h1>Where should the alarm go off?</h1>
+  <p class="lede">A milling machine fails in about 3 of every 100 snapshots. A model that rings early raises false alarms; one that rings late misses failures. Drag the threshold, change what a missed failure costs, and watch 2,000 held-out machines sort themselves.</p>
+  <p class="byline">ES 335 project by Afeef Ahsan (24110017) and Shared Nada T (24110329). All data is synthetic. <a href="https://github.com/AfeefAhsan/machine-failure-alarm-thresholds">Code and reproduction steps on GitHub</a>.</p>
+</header>
+
+<section id="try" class="wrap instrument" aria-labelledby="try-h">
+  <h2 id="try-h">Move the alarm threshold</h2>
+  <noscript><p>This interactive section needs JavaScript. The written sections below work without it.</p></noscript>
+  <div id="loading" class="note">Loading model outputs…</div>
+  <div id="app" hidden>
+    <div class="controls">
+      <label class="ctl"><span>Model</span><select id="model"></select></label>
+      <fieldset class="ctl seg"><legend>Scores</legend>
+        <label><input type="radio" name="scores" value="raw" checked> Raw model scores</label>
+        <label><input type="radio" name="scores" value="cal"> Calibrated probabilities</label>
+      </fieldset>
+      <div class="ctl money"><span>What does each mistake cost?</span>
+        <div class="row"><label>Missed failure $<input type="number" id="cMiss" min="1" step="100" value="5000"></label>
+        <label>False alarm $<input type="number" id="cFalse" min="1" step="50" value="500"></label></div></div>
+      <label class="ctl"><span>A missed failure costs <output id="ratioOut"></output> times a false alarm</span>
+        <input type="range" id="ratio" min="0" max="46" step="1" value="0"></label>
+      <div class="ctl"><span>Try a scenario</span><div class="row presets">
+        <button type="button" data-r="2">Cheap misses 2:1</button><button type="button" data-r="10">Balanced 10:1</button><button type="button" data-r="50">Costly downtime 50:1</button></div></div>
+      <div class="ctl"><span>Watch it move</span><div class="row presets">
+        <button type="button" id="playT">Sweep threshold</button><button type="button" id="playR">Sweep cost ratio</button></div></div>
+      <label class="ctl"><span>Alarm when score is at least <output id="tOut"></output></span>
+        <input type="range" id="thr" min="0" max="1" step="0.005" value="0.5"></label>
+      <label class="check"><input type="checkbox" id="follow" checked> Keep the threshold at the value chosen on training folds for this cost</label>
+    </div>
+
+    <figure class="strip">
+      <canvas id="strip" height="240" role="img" aria-label="Each of the 2,000 test machines drawn as a dot at its model score. Failed machines are in the upper band, healthy machines in the lower band. Click to move the threshold."></canvas>
+      <figcaption id="legend">
+        <span><i class="d caught"></i>failure caught</span><span><i class="d missed"></i>failure missed</span>
+        <span><i class="d false"></i>false alarm</span><span><i class="d quiet"></i>healthy, no alarm</span>
+      </figcaption>
+    </figure>
+
+    <div class="readout" aria-live="polite">
+      <table class="cm">
+        <caption>Outcome at this threshold (2,000 test machines)</caption>
+        <thead><tr><th></th><th>Alarm</th><th>No alarm</th></tr></thead>
+        <tbody><tr><th>Failed</th><td id="tp" class="good"></td><td id="fn" class="bad"></td></tr>
+               <tr><th>Healthy</th><td id="fp" class="bad"></td><td id="tn"></td></tr></tbody>
+      </table>
+      <dl class="stats">
+        <div><dt>Recall</dt><dd id="recall"></dd></div>
+        <div><dt>Precision</dt><dd id="precision"></dd></div>
+        <div><dt>False-alarm rate</dt><dd id="far"></dd></div>
+        <div><dt>Total cost</dt><dd id="cost"></dd></div>
+      </dl>
+      <p id="costNote" class="costnote"></p>
+    </div>
+
+    <div class="charts">
+      <figure><div id="costChart"></div>
+        <figcaption>Cost against threshold, as a share of the cost of never raising an alarm. Filled dot: your threshold. Ring: best threshold in hindsight on the test set (not available in practice).</figcaption></figure>
+      <figure><div id="thrChart"></div>
+        <figcaption>Best threshold chosen on the training folds, for each cost ratio. Dot: current cost ratio.</figcaption></figure>
+    </div>
+
+    <div class="errlist">
+      <div class="tabs" role="tablist">
+        <button role="tab" id="tabMiss" aria-selected="true">Missed failures</button>
+        <button role="tab" id="tabFalse" aria-selected="false">False alarms</button>
+      </div>
+      <div id="errTable" class="scroll"></div>
+    </div>
+  </div>
+</section>
+<section id="lab" class="wrap lab" aria-labelledby="lab-h">
+  <h2 id="lab-h">Build a machine</h2>
+  <p class="labintro">Set the readings of your own milling machine. A small, readable decision tree (9 rules, test PR-AUC <span id="treeAp"></span>) turns them into a failure risk, and your cost settings above decide whether that risk rings the alarm. The map shows the risk everywhere; click it to move your machine.</p>
+  <div class="labgrid">
+    <div class="sliders" id="sliders"></div>
+    <div class="verdict" aria-live="polite">
+      <div class="lampRow"><div id="lamp" class="lamp"></div><div><b id="lampText"></b><div id="lampSub" class="small"></div></div></div>
+      <div class="gauge"><div id="gFill"></div><div id="gCut"></div></div>
+      <div class="gl"><span>0%</span><span id="gCutLbl"></span><span>100%</span></div>
+      <dl class="derived" id="derived"></dl>
+      <h3>Rules that fired</h3><ol id="path" class="path"></ol>
+      <div class="row"><button type="button" id="bFail">Load a real failure</button><button type="button" id="bOk">Load a healthy machine</button><button type="button" id="bReset">Reset</button></div>
+      <p id="loaded" class="small"></p>
+    </div>
+  </div>
+  <div class="mapbar"><label>Horizontal axis <select id="ax"></select></label><label>Vertical axis <select id="ay"></select></label>
+    <label class="inl"><input type="checkbox" id="showPts" checked> Show the 2,000 test machines</label></div>
+  <canvas id="map" height="360" role="img" aria-label="Risk map: shaded by the tree’s failure risk over two chosen readings, with test machines and your machine on top. Click to move your machine."></canvas>
+  <p class="small">Orange shading: risk is above your alarm cutoff, so the alarm would ring. Dark: quiet. Other readings stay at your slider values.</p>
+</section>
+
+<section id="compare" class="wrap lab" aria-labelledby="cmp-h">
+  <h2 id="cmp-h">Compare the models</h2>
+  <p class="labintro">Cost against threshold for every model at your current cost ratio, using the score type chosen above. Tick or untick models. The table gives each model’s own training-fold threshold and what it cost on the test set.</p>
+  <div id="cmpBoxes" class="boxes"></div>
+  <div id="cmpChart"></div>
+  <div class="scroll"><table class="data" id="cmpTable"></table></div>
+</section>
+</div>
+
+<section id="question" class="wrap prose">
+  <h2>The question</h2>
+  <p class="big">Given the operating readings of a milling machine, how does the choice of decision threshold change the balance between missed failures and false alarms, and how does the best threshold shift as the assumed cost of a missed failure relative to a false alarm changes?</p>
+  <p><strong>One row</strong> is one operating snapshot of a simulated milling machine. <strong>The target</strong> is whether that snapshot is a machine failure (1) or not (0). <strong>A prediction is made</strong> at the moment the readings are taken, using only the readings available then: air and process temperature, rotational speed, torque, tool wear and the machine quality type (L, M or H).</p>
+  <p>Failures are rare, so a model can look accurate while catching almost nothing: always answering “no failure” is right 96.6% of the time on our test set. The useful result is therefore not a single accuracy score but three things: how much recall each model reaches at a fixed false-alarm budget, how the cost-optimal threshold moves as the cost ratio changes, and how far the predicted probabilities can be trusted.</p>
+  <p class="limit">Scope of the claim. This is a prediction test on synthetic data. It shows how methods behave under class imbalance. It does not say how real machines fail, and it says nothing about why they fail.</p>
+</section>
+
+<section id="data" class="wrap prose">
+  <h2>Data</h2>
+  <p>Source: the <em>AI4I 2020 Predictive Maintenance Dataset</em> (Matzka, 2020), UCI Machine Learning Repository, <a href="https://doi.org/10.24432/C5HS5C">doi:10.24432/C5HS5C</a>. It is public and free to download; its UCI page lists the CC BY 4.0 licence, and the file is included in the repository under <code>data/raw/</code> with that attribution.</p>
+  <div id="dataFacts" class="facts"></div>
+  <figure><img src="figures/fig_overview.png" alt="Bar charts: 9,661 rows without failure against 339 with failure; failure counts by type: tool wear 46, heat dissipation 115, power 95, overstrain 98, random 19." loading="lazy">
+    <figcaption>Left: the class imbalance. Right: failure types (a row can have more than one, so the types sum to more than 339).</figcaption></figure>
+  <h3>Quality checks that matter for this question</h3>
+  <ul>
+    <li><strong>No missing values</strong> in any of the 14 columns, so no imputation is needed.</li>
+    <li><strong>Imbalance:</strong> 339 failures in 10,000 rows (3.39%). Failure rate by quality type: L 3.9%, M 2.8%, H 2.1%.</li>
+    <li><strong>Target leakage:</strong> the five failure-type columns (TWF, HDF, PWF, OSF, RNF) are the components of the target. They are excluded as inputs and used only after prediction, to study errors. <code>UDI</code> and <code>Product ID</code> are identifiers and are also excluded.</li>
+    <li><strong>Label oddities:</strong> 9 rows are marked as failures but have no failure-type flag, and 18 rows carry a failure-type flag (random failure) but are marked as not failing. We keep the target column as given and report these rows as they are.</li>
+  </ul>
+  <figure><img src="figures/fig_physics.png" alt="Three scatter plots of healthy and failed machines: torque against rotational speed, temperature difference against rotational speed, and torque against tool wear. Failures cluster at the edges." loading="lazy">
+    <figcaption>Failures sit at the edges of the operating range: high torque with low speed, a small temperature gap at low speed, and high torque with high wear.</figcaption></figure>
+</section>
+
+<section id="preprocessing" class="wrap prose">
+  <h2>Preprocessing</h2>
+  <p>The 80/20 split comes first: a stratified split with fixed seed 42 gives 8,000 training rows (271 failures) and 2,000 test rows (68 failures). Everything learned from data is fitted on training folds only.</p>
+  <ul>
+    <li><strong>Scaling and encoding</strong> (standardised numeric columns, one-hot quality type) live inside a scikit-learn <code>Pipeline</code>, so each cross-validation fold fits them on its own training part.</li>
+    <li><strong>Physics-informed features</strong> are fixed formulas with no learned parameters, so they cannot leak: mechanical power = torque × angular speed, temperature difference = process − air temperature, and tool wear × torque. The dataset documentation describes failure conditions in exactly these terms (heat dissipation needs a small temperature gap at low speed, power failure is a power outside a band, overstrain is wear × torque above a limit).</li>
+    <li><strong>Class imbalance</strong> is handled with class weights rather than resampling, so no synthetic rows are created and the test set keeps its natural 3.4% rate.</li>
+    <li><strong>Calibration:</strong> class weights push predicted probabilities far above the true rate. We fit sigmoid or isotonic calibration on training folds (whichever has the lower out-of-fold Brier score) and offer both raw and calibrated scores in the interaction above.</li>
+  </ul>
+</section>
+
+<section id="methods" class="wrap prose">
+  <h2>Baselines and methods</h2>
+  <dl class="defs">
+    <dt>Baseline 1: majority class</dt><dd>Always predicts “no failure”. It scores 96.6% accuracy and finds none of the failures, which is why accuracy is not our headline metric.</dd>
+    <dt>Baseline 2: logistic regression</dt><dd>A simple linear model with class weights. It assumes failure odds change smoothly and additively with the readings, which is a fair first guess and easy to interpret.</dd>
+    <dt>Decision tree</dt><dd>Failure conditions in this machine are thresholds on readings (for example “speed below a limit and temperature gap below a limit”), which is the form a tree learns.</dd>
+    <dt>Random forest</dt><dd>Averages many trees to reduce the variance of a single tree on only 271 training failures.</dd>
+    <dt>Gradient boosting</dt><dd>Builds shallow trees in sequence, each correcting the last; suited to interacting threshold rules. Class-weighted histogram boosting from scikit-learn.</dd>
+  </dl>
+  <p>Each model is run twice, on raw features and on raw plus physics features, to test whether domain knowledge helps. Hyperparameters are small grids (listed in the repository) searched by 5-fold stratified cross-validation on PR-AUC.</p>
+</section>
+
+<section id="evaluation" class="wrap prose">
+  <h2>Evaluation design</h2>
+  <ul>
+    <li><strong>Split first, test once.</strong> Models, hyperparameters, feature sets, calibration type and every threshold are chosen with 5-fold stratified cross-validation on the training set. The model is picked by cross-validated PR-AUC before test results are looked at.</li>
+    <li><strong>Thresholds are never tuned on the test set.</strong> For each cost ratio, the threshold minimises <em>ratio × missed failures + false alarms</em> on out-of-fold training predictions. The test set then shows what that choice would have cost.</li>
+    <li><strong>Primary metric: PR-AUC</strong> (average precision), because it ignores the huge pool of easy negatives. A model that knows nothing scores about the failure rate, 0.034.</li>
+    <li><strong>Operational metrics:</strong> recall at a fixed false-alarm budget (1%, 2%, 5%, 10% of healthy snapshots), precision, F1, and expected cost for cost ratios from 1:1 to 200:1.</li>
+    <li><strong>Probability quality:</strong> Brier score and a reliability curve, before and after calibration.</li>
+    <li><strong>Uncertainty:</strong> the spread across the 5 folds, and a 1,000-sample bootstrap of the test set for the chosen model. With only 68 test failures, single numbers are not exact.</li>
+  </ul>
+</section>
+
+<section id="results" class="wrap prose">
+  <h2>Results</h2>
+  <p class="big">The physics-informed features matter more than the choice of model, and boosting with those features wins: cross-validated PR-AUC 0.904 against 0.034 for the majority baseline.</p>
+  <div class="scroll"><table id="modelTable" class="data"></table></div>
+  <p class="small" id="modelNote"></p>
+
+  <figure><img src="figures/fig_cv.png" alt="Bar chart of cross-validated PR-AUC for four models with raw features and with physics features; physics features raise every model, most for tree-based ones." loading="lazy">
+    <figcaption>Cross-validated PR-AUC, raw versus physics-informed features (bars: mean of 5 folds, whiskers: one standard deviation). Logistic regression gains least because the failure rules are thresholds, not smooth trends.</figcaption></figure>
+
+  <h3>What a false-alarm budget buys</h3>
+  <p>For the chosen model (gradient boosting with physics features), the threshold is set on training folds so that about the stated share of healthy snapshots raises an alarm, then applied once to the test set.</p>
+  <div class="scroll"><table id="budgetTable" class="data"></table></div>
+
+  <h3>How the best threshold moves with cost</h3>
+  <p>When a missed failure costs about as much as a false alarm, the best policy is to alarm only when the model is nearly certain (a raw-score threshold around 0.92). As the missed failure becomes more expensive, the threshold drops: around 0.77 at 10:1, 0.30 at 16:1, 0.15 at 24:1 and about 0.10 beyond 60:1. The cost curve is flat across a wide middle range, so for a strong model the exact threshold matters little between roughly 0.2 and 0.8 when misses are expensive, but it matters a lot at the low end, where false alarms pile up quickly.</p>
+  <div class="pair">
+    <figure><img src="figures/fig_cost.png" alt="Cost against alarm threshold for five cost ratios, showing a long flat valley and steep rise at very low thresholds." loading="lazy"><figcaption>Test-set cost relative to never alarming. Dots mark thresholds chosen on training folds.</figcaption></figure>
+    <figure><img src="figures/fig_threshold.png" alt="Best threshold against cost ratio for four models; the thresholds fall as the ratio rises." loading="lazy"><figcaption>Best threshold against cost ratio, per model.</figcaption></figure>
+  </div>
+  <p>At the reference ratio of 10:1 the chosen model, using a threshold picked on training folds, caught 59 of 68 failures with 5 false alarms: a cost of 95 false-alarm units against 680 for never alarming and 1,932 for always alarming.</p>
+
+  <h3>Can the probabilities be trusted?</h3>
+  <p>Not the raw ones. Class weights make the model act as if failures were common, so its raw scores overstate the risk and the best threshold on them lands at odd values such as 0.77. After isotonic calibration the Brier score on the test set falls from 0.0173 to 0.0063 and the scores read as probabilities. Calibrated thresholds follow the textbook rule “alarm when the failure probability exceeds 1 ÷ (1 + ratio)” in direction but not exactly (at 10:1 the rule gives 0.09 and our training folds chose about 0.20), a reminder that with 271 training failures the empirical optimum is noisy.</p>
+  <figure class="narrow"><img src="figures/fig_calibration.png" alt="Reliability curve: raw class-weighted scores lie far below the diagonal, calibrated scores lie near it." loading="lazy"><figcaption>Reliability on the test set (six equal-count bins, so each point rests on few failures).</figcaption></figure>
+</section>
+
+<section id="errors" class="wrap prose">
+  <h2>Errors</h2>
+  <p>At the reference setting (10:1, training-fold threshold 0.77 on raw scores), the chosen model missed 9 of 68 failures and raised 5 false alarms. Splitting the failures by the type flag they carry shows where the misses come from.</p>
+  <figure class="narrow"><img src="figures/fig_errors.png" alt="Share of failures caught by type: heat dissipation, power and overstrain failures all caught; tool wear 3 of 10; random and unlabelled failures none." loading="lazy"><figcaption>Share of test failures caught, by failure-type flag.</figcaption></figure>
+  <ul>
+    <li><strong>Every heat-dissipation, power and overstrain failure was caught</strong> (29, 13 and 16). These follow deterministic rules in the data, and the physics features expose them.</li>
+    <li><strong>Tool-wear failures were mostly missed</strong> (7 of 10): in the dataset they occur at a random point between 200 and 240 minutes of wear, so no model can tell which tool will fail at which minute.</li>
+    <li><strong>Random failures and unlabelled failures were never caught</strong> (4 and 2). Random failures are unpredictable by construction, so recall has a ceiling below 100%.</li>
+    <li><strong>The false alarms</strong> are healthy machines running close to a failure limit: four have high torque with high tool wear, and one runs at a power close to the low-power limit. They are plausible warnings rather than nonsense, but the data labels them healthy.</li>
+  </ul>
+  <p>The table below lists the actual missed failures at the reference setting.</p>
+  <div class="scroll"><table id="missTable" class="data"></table></div>
+</section>
+
+<section id="limitations" class="wrap prose">
+  <h2>Limitations</h2>
+  <ul>
+    <li><strong>Synthetic data.</strong> Failure rules were written by the dataset’s author. Our physics features come from those same rules, so the benefit of domain knowledge here is likely larger than it would be on real machines.</li>
+    <li><strong>Few positives.</strong> 68 test failures give wide uncertainty: the 95% bootstrap interval for the chosen model’s test PR-AUC is 0.85 to 0.97, and a single missed failure moves recall by 1.5 points. Differences between the top models are within this noise.</li>
+    <li><strong>Optimistic tuning scores.</strong> The cross-validated scores are the best of a small grid, so they are slightly optimistic. We report test results for all models for transparency, but selection used only cross-validation.</li>
+    <li><strong>Simple cost model.</strong> One fixed cost ratio, no cost that grows with how long a failure goes unnoticed, no cost of inspecting after an alarm, and rows treated as independent snapshots although real machines produce time series.</li>
+    <li><strong>Noisy thresholds.</strong> Thresholds come from 271 training failures, so they would shift with a different split. The interaction shows the test-set best threshold next to the chosen one for this reason.</li>
+    <li><strong>Prediction, not causation.</strong> A high score means the readings resemble past failures. It does not show that any reading causes a failure.</li>
+  </ul>
+</section>
+
+<section id="conclusion" class="wrap prose">
+  <h2>Conclusion</h2>
+  <p class="big">The threshold is a business decision as much as a modelling one: the same model has a best threshold near 0.9 when misses are cheap and near 0.1 when they are costly.</p>
+  <p>With physics-informed features, gradient boosting reached 0.92 test PR-AUC and caught 92.6% of failures while raising alarms on 5% of healthy snapshots; the majority baseline catches none. Accuracy barely moves (96.6% for the baseline, 97.4% for the model at a 0.5 threshold), which is why we judged models by PR-AUC, recall at a false-alarm budget and cost. Raw class-weighted probabilities should not be read as risks until they are calibrated. The remaining misses are mostly failures that the data makes random, so a better model would not fix them.</p>
+</section>
+
+<section id="reproduce" class="wrap prose">
+  <h2>Reproduce the result</h2>
+  <ol>
+    <li>Clone <a href="https://github.com/AfeefAhsan/machine-failure-alarm-thresholds">the repository</a> and install the packages: <code>pip install -r requirements.txt</code> (Python 3.10 or newer).</li>
+    <li>The dataset is already in <code>data/raw/ai4i2020.csv</code>. To fetch it fresh, download it from the UCI link above.</li>
+    <li>Run <code>python src/pipeline.py</code> from the repository root (about 5 minutes on one CPU core), or run <code>notebooks/analysis.ipynb</code>. It rewrites <code>data/train.csv</code>, <code>data/test.csv</code>, the figures and <code>site_data/results.json</code>.</li>
+    <li>Run <code>python src/export_tree.py</code> and then <code>python src/build_site.py</code>. This writes one self-contained <code>index.html</code> (styles, scripts, data and figures inline), which you can open straight from disk or publish on GitHub Pages.</li>
+  </ol>
+  <p>Split: stratified 80/20, <code>random_state=42</code>. Cross-validation: 5-fold stratified, shuffled, seed 42. The test probabilities used by the interaction are precomputed (<code>site_data/results.json</code>); the lab’s small tree is exported by <code>src/export_tree.py</code> from the training split only; no server, credentials or private data are involved.</p>
+  <h3>Team and AI-use disclosure</h3>
+  <p><strong>Authors:</strong> Afeef Ahsan (24110017) and Shared Nada T (24110329), ES 335.</p>
+  <p><strong>AI assistance:</strong> Claude (Anthropic) was used to assist with writing the code, debugging, and implementing the website. The project ideas, overall approach, analysis decisions, and visualisation concepts were developed by our team. We used Claude as a coding assistant to bring our ideas into implementation. We ran and tested the code, verified the results, and take responsibility for the final work.</p>
+  <p><strong>Cited material:</strong> Matzka, S. (2020). Explainable artificial intelligence for predictive maintenance applications. <em>Third International Conference on Artificial Intelligence for Industries (AI4I)</em>, 69–74. Dataset: AI4I 2020 Predictive Maintenance Dataset, UCI Machine Learning Repository. Libraries: scikit-learn, pandas, NumPy, Matplotlib, Seaborn.</p>
+  <p><strong>Team contributions:</strong> Afeef Ahsan worked on developing and testing the models, creating physics-based features, and designing the interactive machine prediction section. Shared Nada T worked on comparing model results, analysing missed failures and false alarms, and studying how different alarm thresholds and failure costs affect predictions. Both contributed to the project ideas, visualisation design, and interpretation of results.</p>
+</section>
+</main>
+<footer class="wrap"><p>ES 335 course project. Synthetic data; nothing here describes real machines. Repository: <a href="https://github.com/AfeefAhsan/machine-failure-alarm-thresholds">github.com/AfeefAhsan/machine-failure-alarm-thresholds</a></p></footer>
+<script src="app.js"></script>
+<script src="explore.js"></script>
+</body>
+</html>
